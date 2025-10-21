@@ -10,10 +10,12 @@ import {
   Home,
   Package,
   RotateCcw,
+  ShieldCheck,
   ThumbsDown,
   ThumbsUp,
   X
 } from "lucide-react";
+import UserManagementPanel from "./UserManagementPanel.jsx";
 
 const icd10Data = {
   F0: {
@@ -497,6 +499,10 @@ const ICD10LearningSystem = () => {
     setCurrentCardIndex(0);
   }, []);
 
+  const startUserManagement = useCallback(() => {
+    setMode("users");
+  }, []);
+
   const resetBoxSystem = useCallback(() => {
     setBoxSystem(getInitialBoxes());
     setCurrentLeitnerCard(null);
@@ -568,7 +574,7 @@ const ICD10LearningSystem = () => {
             <p className="text-xl text-gray-600">F0-F9: Psychische und Verhaltensstörungen</p>
           </div>
 
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-6">
             <button
               type="button"
               onClick={() => setMode("explorer")}
@@ -607,6 +613,16 @@ const ICD10LearningSystem = () => {
               <Award className="w-12 h-12 mx-auto mb-3" />
               <h2 className="text-xl font-bold mb-2">Quiz</h2>
               <p className="text-sm text-green-100">Wissen testen</p>
+            </button>
+
+            <button
+              type="button"
+              onClick={startUserManagement}
+              className="bg-gradient-to-br from-slate-500 to-slate-700 text-white p-6 rounded-2xl shadow-xl hover:shadow-2xl transform hover:scale-105 transition-all"
+            >
+              <ShieldCheck className="w-12 h-12 mx-auto mb-3" />
+              <h2 className="text-xl font-bold mb-2">Benutzer</h2>
+              <p className="text-sm text-slate-200">Login &amp; Status</p>
             </button>
           </div>
 
@@ -662,11 +678,18 @@ const ICD10LearningSystem = () => {
               <li>
                 <strong>Quiz:</strong> Teste dich selbst mit Fallbeispielen
               </li>
+              <li>
+                <strong>Benutzer:</strong> Verwalte Logins mit sicherer Passwort-Hashing-API und getrenntem Statusverlauf
+              </li>
             </ul>
           </div>
         </div>
       </div>
     );
+  }
+
+  if (mode === "users") {
+    return <UserManagementPanel onBack={resetToHome} />;
   }
 
   if (mode === "leitner" && currentLeitnerCard) {
