@@ -7,6 +7,7 @@ Diese Anwendung ist eine interaktive Lernplattform für die ICD-10-Kategorien F0
 - **Lernkarten**: Lineares Durcharbeiten aller Diagnosen.
 - **Quiz**: Fallbasiertes Multiple-Choice-Training.
 - **Benutzerverwaltung**: Registrieren, anmelden und Statusverläufe pro Benutzer pflegen.
+- **Fortschritt-Sync**: Leitner-Boxen, Lernkarten-Stand und Quiz-Erfolge werden pro Benutzer gespeichert.
 
 ## Erste Schritte
 
@@ -45,8 +46,8 @@ Der Preview-Server dient zum Testen des optimierten Builds.
 ├── package.json
 ├── postcss.config.js
 ├── server
-│   ├── db.js                   # Initialisiert DB und Tabellen (users, user_statuses)
-│   ├── index.js                # Express-Server mit Auth-/Status-Endpunkten
+│   ├── db.js                   # Initialisiert DB und Tabellen (users, user_statuses, user_learning_states)
+│   ├── index.js                # Express-Server mit Auth-/Status-/Progress-Endpunkten
 │   ├── middleware
 │   │   └── authMiddleware.js   # JWT-Validierung für geschützte Routen
 │   └── repositories
@@ -62,12 +63,13 @@ Der Preview-Server dient zum Testen des optimierten Builds.
         └── UserManagementPanel.jsx
 ```
 
-Die ICD-10-Lernmodi leben in `ICD10LearningSystem.jsx`. Das neue `UserManagementPanel.jsx` bindet die Express-API ein und bietet Registrierung, Login und Statusverwaltung.
+Die ICD-10-Lernmodi leben in `ICD10LearningSystem.jsx`. Das neue `UserManagementPanel.jsx` bindet die Express-API ein und bietet Registrierung, Login, Statusverwaltung und synchronisierten Lernfortschritt.
 
 ## Benutzer-Service (Express + SQLite)
 
 - Passwörter werden mit [bcryptjs](https://www.npmjs.com/package/bcryptjs) gehasht und niemals im Klartext gespeichert.
 - Stati werden getrennt von Stammdaten in der Tabelle `user_statuses` versioniert und sind damit nachvollziehbar.
+- Lernstände (Leitner-Boxen, Flashcard-Index, kumulative Quizwerte) landen in `user_learning_states` und werden automatisch bei jeder Änderung gespeichert.
 - Authentifizierung erfolgt via JWT (Gültigkeit standardmäßig 2 Stunden).
 - Standard-Ports und Pfade lassen sich per Environment-Variablen überschreiben:
 
@@ -80,10 +82,12 @@ Die ICD-10-Lernmodi leben in `ICD10LearningSystem.jsx`. Das neue `UserManagement
 
 ### Wichtige API-Endpunkte
 
-- `POST /api/auth/register` – Benutzer registrieren (`email`, `password`, optional `status`).
-- `POST /api/auth/login` – Login, liefert JWT und aktuellen Status.
+- `POST /api/auth/register` – Benutzer registrieren (`email`, `password`, optional `status`), liefert initialen Fortschritt.
+- `POST /api/auth/login` – Login, liefert JWT, aktuellen Status und Fortschritt.
 - `GET /api/users/me` – Stammdaten & letzter Status des eingeloggten Users.
 - `GET /api/users/me/statuses` – kompletter Statusverlauf.
 - `POST /api/users/me/statuses` – neuen Status anhängen.
+- `GET /api/users/me/progress` – aktuellen Lernfortschritt (Leitner-Boxen, Flashcards, Quiz) abrufen.
+- `PUT /api/users/me/progress` – Lernfortschritt aktualisieren (wird vom Frontend automatisch angestoßen).
 
 Für produktive Deployments sollte der Server hinter HTTPS laufen und `JWT_SECRET` unbedingt ersetzt werden.

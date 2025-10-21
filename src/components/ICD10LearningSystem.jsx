@@ -1,13 +1,17 @@
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  BarChart3,
   ArrowLeft,
   ArrowRight,
   Award,
   BookOpen,
   Brain,
+  Cloud,
+  CloudOff,
   Check,
   FileText,
   Home,
+  Loader2,
   Package,
   RotateCcw,
   ShieldCheck,
@@ -425,6 +429,86 @@ const allDiagnoses = Object.keys(icd10Data).flatMap((mainCat) =>
 
 const boxPriority = [1, 2, 3, 4, 5];
 
+const API_BASE_URL = import.meta.env.VITE_USER_SERVICE_URL || "http://localhost:4000";
+const AUTH_STORAGE_KEY = "icd10-learning-auth";
+const defaultAuthState = { token: null, user: null };
+
+const readStoredAuthState = () => {
+  if (typeof window === "undefined") {
+    return defaultAuthState;
+  }
+
+  try {
+    const raw = window.localStorage.getItem(AUTH_STORAGE_KEY);
+    if (!raw) {
+      return defaultAuthState;
+    }
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === "object" && parsed.token && parsed.user) {
+      return parsed;
+    }
+  } catch (error) {
+    console.warn("Konnte gespeicherte Anmeldung nicht lesen:", error);
+  }
+
+  return defaultAuthState;
+};
+
+const serialiseProgressSnapshot = (boxes, index, quizScore) => {
+  const sortedBoxes = {};
+  Object.keys(boxes || {})
+    .sort()
+    .forEach((key) => {
+      sortedBoxes[key] = boxes[key];
+    });
+
+  return JSON.stringify({
+    boxes: sortedBoxes,
+    index,
+    quiz: {
+      correct: quizScore?.correct ?? 0,
+      total: quizScore?.total ?? 0
+    }
+  });
+};
+
+const normaliseBoxesFromServer = (boxes) => {
+  const initial = getInitialBoxes();
+  if (boxes && typeof boxes === "object") {
+    Object.entries(boxes).forEach(([key, value]) => {
+      const numeric = Number(value);
+      const nextValue = Number.isFinite(numeric)
+        ? Math.min(5, Math.max(1, Math.round(numeric)))
+        : initial[key] || 1;
+      initial[key] = nextValue;
+    });
+  }
+  return initial;
+};
+
+const clampFlashcardIndex = (index) => {
+  if (!Number.isFinite(index) || index < 0) {
+    return 0;
+  }
+  const maxIndex = Math.max(0, allDiagnoses.length - 1);
+  return Math.min(maxIndex, Math.floor(index));
+};
+
+const formatDateTime = (value) => {
+  if (!value) {
+    return "—";
+  }
+
+  try {
+    return new Intl.DateTimeFormat("de-DE", {
+      dateStyle: "medium",
+      timeStyle: "short"
+    }).format(new Date(value));
+  } catch (error) {
+    return value;
+  }
+};
+
 const ICD10LearningSystem = () => {
   const [mode, setMode] = useState("menu");
   const [selectedMainCat, setSelectedMainCat] = useState(null);
@@ -436,6 +520,16 @@ const ICD10LearningSystem = () => {
   const [currentQuizCase, setCurrentQuizCase] = useState(null);
   const [boxSystem, setBoxSystem] = useState(getInitialBoxes);
   const [currentLeitnerCard, setCurrentLeitnerCard] = useState(null);
+  const [authState, setAuthState] = useState(() => readStoredAuthState());
+  const [progressMeta, setProgressMeta] = useState({ updatedAt: null });
+  const [progressLoaded, setProgressLoaded] = useState(false);
+  const [isProgressLoading, setIsProgressLoading] = useState(false);
+  const [progressSyncState, setProgressSyncState] = useState("idle");
+  const [progressError, setProgressError] = useState(null);
+  const [lifetimeQuizScore, setLifetimeQuizScore] = useState({ correct: 0, total: 0 });
+  const saveTimeoutRef = useRef(null);
+  const saveControllerRef = useRef(null);
+  const lastSyncedSnapshotRef = useRef(null);
 
   const boxStats = useMemo(() => {
     const stats = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 };
@@ -444,6 +538,243 @@ const ICD10LearningSystem = () => {
     });
     return stats;
   }, [boxSystem]);
+
+  const isAuthenticated = Boolean(authState?.token && authState?.user);
+
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+    if (authState?.token) {
+      window.localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify(authState));
+    } else {
+      window.localStorage.removeItem(AUTH_STORAGE_KEY);
+    }
+  }, [authState]);
+
+  const applyProgressFromServer = useCallback((progress) => {
+    if (!progress) {
+      const defaults = getInitialBoxes();
+      setBoxSystem(defaults);
+      setCurrentCardIndex(0);
+      setLifetimeQuizScore({ correct: 0, total: 0 });
+      setProgressMeta({ updatedAt: null });
+      setShowAnswer(false);
+      setCurrentLeitnerCard(null);
+      lastSyncedSnapshotRef.current = serialiseProgressSnapshot(defaults, 0, {
+        correct: 0,
+        total: 0
+      });
+      return;
+    }
+
+    const normalisedBoxes = normaliseBoxesFromServer(progress.leitnerBoxes);
+    const nextIndex = clampFlashcardIndex(progress.flashcardIndex);
+    const rawCorrect = Number(progress.quizScore?.correct);
+    const normalisedCorrect =
+      Number.isFinite(rawCorrect) && rawCorrect >= 0 ? Math.floor(rawCorrect) : 0;
+    const rawTotal = Number(progress.quizScore?.total);
+    const normalisedTotal =
+      Number.isFinite(rawTotal) && rawTotal >= 0
+        ? Math.max(Math.floor(rawTotal), normalisedCorrect)
+        : normalisedCorrect;
+
+    const quiz = { correct: normalisedCorrect, total: normalisedTotal };
+
+    setBoxSystem(normalisedBoxes);
+    setCurrentCardIndex(nextIndex);
+    setLifetimeQuizScore(quiz);
+    setProgressMeta({ updatedAt: progress.updatedAt || null });
+    setShowAnswer(false);
+    setCurrentLeitnerCard(null);
+    lastSyncedSnapshotRef.current = serialiseProgressSnapshot(normalisedBoxes, nextIndex, quiz);
+  }, []);
+
+  const handleAuthChange = useCallback(
+    (nextAuth) => {
+      if (!nextAuth || !nextAuth.token) {
+        setAuthState(defaultAuthState);
+        applyProgressFromServer(null);
+        setProgressLoaded(false);
+        setProgressSyncState("idle");
+        setProgressError(null);
+        return;
+      }
+
+      setAuthState({ token: nextAuth.token, user: nextAuth.user });
+      if (nextAuth.progress) {
+        applyProgressFromServer(nextAuth.progress);
+        setProgressLoaded(true);
+        setProgressSyncState("saved");
+      } else {
+        setProgressLoaded(false);
+      }
+    },
+    [applyProgressFromServer]
+  );
+
+  useEffect(() => {
+    if (!authState?.token) {
+      setBoxSystem(getInitialBoxes());
+      setCurrentCardIndex(0);
+      setLifetimeQuizScore({ correct: 0, total: 0 });
+      setProgressMeta({ updatedAt: null });
+      setProgressLoaded(false);
+      setIsProgressLoading(false);
+      setProgressSyncState("idle");
+      setProgressError(null);
+      lastSyncedSnapshotRef.current = null;
+      if (saveControllerRef.current) {
+        saveControllerRef.current.abort();
+        saveControllerRef.current = null;
+      }
+      return;
+    }
+
+    if (progressLoaded) {
+      return;
+    }
+
+    setIsProgressLoading(true);
+    setProgressError(null);
+    const controller = new AbortController();
+
+    fetch(`${API_BASE_URL}/api/users/me/progress`, {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${authState.token}`
+      },
+      signal: controller.signal
+    })
+      .then(async (response) => {
+        if (!response.ok) {
+          const payload = await response.json().catch(() => ({}));
+          const message = payload?.message || "Fortschritt konnte nicht geladen werden.";
+          throw new Error(message);
+        }
+        return response.json();
+      })
+      .then((payload) => {
+        if (controller.signal.aborted) {
+          return;
+        }
+        applyProgressFromServer(payload?.progress);
+        setProgressLoaded(true);
+        setProgressSyncState("saved");
+      })
+      .catch((error) => {
+        if (controller.signal.aborted) {
+          return;
+        }
+        setProgressError(error.message || "Fortschritt konnte nicht geladen werden.");
+        setProgressLoaded(false);
+      })
+      .finally(() => {
+        if (!controller.signal.aborted) {
+          setIsProgressLoading(false);
+        }
+      });
+
+    return () => {
+      controller.abort();
+    };
+  }, [authState?.token, progressLoaded, applyProgressFromServer]);
+
+  useEffect(() => {
+    if (!authState?.token || !progressLoaded) {
+      return undefined;
+    }
+
+    const payload = {
+      leitnerBoxes: boxSystem,
+      flashcardIndex: currentCardIndex,
+      quizScore: lifetimeQuizScore
+    };
+    const snapshot = serialiseProgressSnapshot(
+      payload.leitnerBoxes,
+      payload.flashcardIndex,
+      payload.quizScore
+    );
+
+    if (snapshot === lastSyncedSnapshotRef.current) {
+      return undefined;
+    }
+
+    if (saveTimeoutRef.current) {
+      clearTimeout(saveTimeoutRef.current);
+    }
+
+    setProgressSyncState((prev) => (prev === "saving" ? prev : "pending"));
+
+    saveTimeoutRef.current = setTimeout(() => {
+      if (saveControllerRef.current) {
+        saveControllerRef.current.abort();
+      }
+
+      const controller = new AbortController();
+      saveControllerRef.current = controller;
+
+      setProgressSyncState("saving");
+      setProgressError(null);
+
+      fetch(`${API_BASE_URL}/api/users/me/progress`, {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${authState.token}`
+        },
+        body: JSON.stringify(payload),
+        signal: controller.signal
+      })
+        .then(async (response) => {
+          if (!response.ok) {
+            const body = await response.json().catch(() => ({}));
+            const message = body?.message || "Fortschritt konnte nicht gespeichert werden.";
+            throw new Error(message);
+          }
+          return response.json();
+        })
+        .then((result) => {
+          if (controller.signal.aborted) {
+            return;
+          }
+          applyProgressFromServer(result?.progress);
+          setProgressLoaded(true);
+          setProgressSyncState("saved");
+        })
+        .catch((error) => {
+          if (controller.signal.aborted) {
+            return;
+          }
+          setProgressError(error.message || "Fortschritt konnte nicht gespeichert werden.");
+          setProgressSyncState("error");
+        });
+    }, 700);
+
+    return () => {
+      if (saveTimeoutRef.current) {
+        clearTimeout(saveTimeoutRef.current);
+        saveTimeoutRef.current = null;
+      }
+    };
+  }, [
+    authState?.token,
+    progressLoaded,
+    boxSystem,
+    currentCardIndex,
+    lifetimeQuizScore.correct,
+    lifetimeQuizScore.total,
+    applyProgressFromServer
+  ]);
+
+  useEffect(() => () => {
+    if (saveTimeoutRef.current) {
+      clearTimeout(saveTimeoutRef.current);
+    }
+    if (saveControllerRef.current) {
+      saveControllerRef.current.abort();
+    }
+  }, []);
 
   const selectNextLeitnerCard = useCallback(
     (boxes = boxSystem) => {
@@ -496,7 +827,6 @@ const ICD10LearningSystem = () => {
   const startFlashcards = useCallback(() => {
     setMode("flashcards");
     setShowAnswer(false);
-    setCurrentCardIndex(0);
   }, []);
 
   const startUserManagement = useCallback(() => {
@@ -514,7 +844,6 @@ const ICD10LearningSystem = () => {
     setSelectedMainCat(null);
     setSelectedSubCat(null);
     setShowAnswer(false);
-    setCurrentCardIndex(0);
   }, []);
 
   const handleLeitnerAnswer = useCallback(
@@ -550,6 +879,10 @@ const ICD10LearningSystem = () => {
         correct: prev.correct + (isCorrect ? 1 : 0),
         total: prev.total + 1
       }));
+      setLifetimeQuizScore((prev) => ({
+        correct: prev.correct + (isCorrect ? 1 : 0),
+        total: prev.total + 1
+      }));
     },
     [currentQuizCase]
   );
@@ -562,16 +895,131 @@ const ICD10LearningSystem = () => {
   const allDiagnosesCount = allDiagnoses.length;
   const currentFlashcard = allDiagnoses[currentCardIndex];
 
+  const advancedCards = boxStats[4] + boxStats[5];
+  const masteryPercent =
+    allDiagnosesCount > 0 ? Math.round((advancedCards / allDiagnosesCount) * 100) : 0;
+  const quizAccuracy =
+    lifetimeQuizScore.total > 0
+      ? Math.round((lifetimeQuizScore.correct / lifetimeQuizScore.total) * 100)
+      : null;
+  const userEmail = authState?.user?.email || null;
+  const latestStatus = authState?.user?.status || null;
+  const latestStatusUpdatedAt = authState?.user?.statusUpdatedAt || null;
+
+  let syncStatusIcon = <Cloud className="w-5 h-5 text-emerald-600" />;
+  let syncStatusLabel = "Synchronisiert";
+  let syncStatusColor = "text-emerald-600";
+
+  if (!progressMeta.updatedAt && progressSyncState === "idle" && !isProgressLoading) {
+    syncStatusIcon = <Cloud className="w-5 h-5 text-slate-500" />;
+    syncStatusLabel = "Noch kein Sync";
+    syncStatusColor = "text-slate-600";
+  }
+
+  if (isProgressLoading) {
+    syncStatusIcon = <Loader2 className="w-5 h-5 text-indigo-600 animate-spin" />;
+    syncStatusLabel = "Fortschritt wird geladen...";
+    syncStatusColor = "text-indigo-600";
+  } else if (progressSyncState === "saving") {
+    syncStatusIcon = <Loader2 className="w-5 h-5 text-indigo-600 animate-spin" />;
+    syncStatusLabel = "Speichern läuft...";
+    syncStatusColor = "text-indigo-600";
+  } else if (progressSyncState === "pending") {
+    syncStatusIcon = <Cloud className="w-5 h-5 text-indigo-500 animate-pulse" />;
+    syncStatusLabel = "Speichern geplant";
+    syncStatusColor = "text-indigo-600";
+  } else if (progressSyncState === "error") {
+    syncStatusIcon = <CloudOff className="w-5 h-5 text-red-600" />;
+    syncStatusLabel = "Speichern fehlgeschlagen";
+    syncStatusColor = "text-red-600";
+  }
+
   if (mode === "menu") {
     return (
       <div className="min-h-screen bg-gradient-to-br from-indigo-50 via-purple-50 to-pink-50 p-8">
         <div className="max-w-5xl mx-auto">
-          <div className="text-center mb-12">
-            <h1 className="text-5xl font-bold text-gray-800 mb-4 flex items-center justify-center gap-3">
-              <Brain className="w-12 h-12 text-indigo-600" />
-              ICD-10 Lernsystem
-            </h1>
-            <p className="text-xl text-gray-600">F0-F9: Psychische und Verhaltensstörungen</p>
+          <div className="flex flex-col lg:flex-row lg:items-start lg:justify-between gap-6 mb-12">
+            <div className="text-center lg:text-left">
+              <h1 className="text-5xl font-bold text-gray-800 mb-4 flex items-center justify-center lg:justify-start gap-3">
+                <Brain className="w-12 h-12 text-indigo-600" />
+                ICD-10 Lernsystem
+              </h1>
+              <p className="text-xl text-gray-600">F0-F9: Psychische und Verhaltensstörungen</p>
+            </div>
+            <div className="w-full lg:w-80">
+              {isAuthenticated ? (
+                <div className="bg-white rounded-2xl shadow-xl p-6 space-y-4">
+                  <div className="flex items-center gap-3">
+                    <ShieldCheck className="w-6 h-6 text-emerald-600" />
+                    <div className="text-left">
+                      <p className="text-xs uppercase tracking-wide text-slate-500">Angemeldet als</p>
+                      <p className="text-sm font-semibold text-slate-800 break-all">{userEmail}</p>
+                    </div>
+                  </div>
+                  <div className="space-y-3 text-sm text-slate-700">
+                    <div className="flex items-start justify-between gap-3">
+                      <div>
+                        <p className="text-xs uppercase tracking-wide text-slate-500">Status</p>
+                        <p className="font-semibold text-slate-800">{latestStatus || '—'}</p>
+                      </div>
+                      <span className="text-xs text-slate-500">{formatDateTime(latestStatusUpdatedAt)}</span>
+                    </div>
+                    <div>
+                      <p className="text-xs uppercase tracking-wide text-slate-500">Leitner-Fortschritt</p>
+                      <p className="font-semibold text-slate-800">
+                        {masteryPercent}% ({advancedCards}/{allDiagnosesCount} Karten in Box 4-5)
+                      </p>
+                    </div>
+                    <div>
+                      <p className="text-xs uppercase tracking-wide text-slate-500">Quiz-Genauigkeit</p>
+                      <p className="font-semibold text-slate-800">
+                        {quizAccuracy !== null
+                          ? `${quizAccuracy}% (${lifetimeQuizScore.correct}/${lifetimeQuizScore.total})`
+                          : 'Noch keine Antworten'}
+                      </p>
+                    </div>
+                    <div className="flex items-start gap-3">
+                      {syncStatusIcon}
+                      <div>
+                        <p className={`text-sm font-semibold ${syncStatusColor}`}>{syncStatusLabel}</p>
+                        <p className="text-xs text-slate-500">
+                          Stand: {progressMeta.updatedAt ? formatDateTime(progressMeta.updatedAt) : 'Noch keine Speicherung'}
+                        </p>
+                        {progressError && (
+                          <p className="text-xs text-red-600 mt-1">{progressError}</p>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={startUserManagement}
+                    className="w-full bg-slate-900 text-white py-2.5 rounded-xl font-semibold hover:bg-slate-800 transition-all"
+                  >
+                    Account-Verwaltung
+                  </button>
+                </div>
+              ) : (
+                <div className="bg-white rounded-2xl shadow-xl p-6 space-y-4 text-left">
+                  <div className="flex items-center gap-3">
+                    <ShieldCheck className="w-6 h-6 text-slate-700" />
+                    <div>
+                      <p className="text-lg font-semibold text-slate-800">Sichere deinen Fortschritt</p>
+                      <p className="text-sm text-slate-600">
+                        Registriere dich, um Leitner-Boxen, Lernkarten-Stand und Quiz-Erfolge zu speichern.
+                      </p>
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={startUserManagement}
+                    className="inline-flex items-center justify-center gap-2 bg-slate-900 text-white px-4 py-2.5 rounded-xl font-semibold hover:bg-slate-800 transition-all w-full"
+                  >
+                    Benutzer anmelden
+                  </button>
+                </div>
+              )}
+            </div>
           </div>
 
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-6">
@@ -653,6 +1101,15 @@ const ICD10LearningSystem = () => {
                 </div>
               ))}
             </div>
+            <div className="mt-4 bg-indigo-50 border border-indigo-100 rounded-lg p-4 text-indigo-900">
+              <div className="flex items-center gap-2 font-semibold">
+                <BarChart3 className="w-4 h-4" />
+                <span>{masteryPercent}% der Karten in Box 4-5</span>
+              </div>
+              <p className="text-xs mt-1">
+                {advancedCards} von {allDiagnosesCount} Diagnosen sitzen bereits sicher.
+              </p>
+            </div>
             <button
               type="button"
               onClick={resetBoxSystem}
@@ -679,7 +1136,7 @@ const ICD10LearningSystem = () => {
                 <strong>Quiz:</strong> Teste dich selbst mit Fallbeispielen
               </li>
               <li>
-                <strong>Benutzer:</strong> Verwalte Logins mit sicherer Passwort-Hashing-API und getrenntem Statusverlauf
+                <strong>Benutzer:</strong> Sicherer Login inkl. Statusverlauf und synchronisiertem Lernfortschritt
               </li>
             </ul>
           </div>
@@ -689,7 +1146,14 @@ const ICD10LearningSystem = () => {
   }
 
   if (mode === "users") {
-    return <UserManagementPanel onBack={resetToHome} />;
+    return (
+      <UserManagementPanel
+        onBack={resetToHome}
+        initialAuthToken={authState?.token}
+        initialUser={authState?.user}
+        onAuthChange={handleAuthChange}
+      />
+    );
   }
 
   if (mode === "leitner" && currentLeitnerCard) {

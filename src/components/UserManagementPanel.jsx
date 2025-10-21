@@ -1,4 +1,4 @@
-import { useState, useMemo } from 'react';
+import { useState, useMemo, useEffect } from 'react';
 import { ArrowLeft, Eye, EyeOff, ListChecks, LogIn, Plus, ShieldCheck, UserPlus } from 'lucide-react';
 
 const API_BASE_URL = import.meta.env.VITE_USER_SERVICE_URL || 'http://localhost:4000';
@@ -18,7 +18,12 @@ function formatDate(value) {
   }
 }
 
-export default function UserManagementPanel({ onBack }) {
+export default function UserManagementPanel({
+  onBack,
+  initialAuthToken = null,
+  initialUser = null,
+  onAuthChange
+}) {
   const [activeTab, setActiveTab] = useState('register');
   const [registerForm, setRegisterForm] = useState(defaultRegisterState);
   const [loginForm, setLoginForm] = useState(defaultLoginState);
@@ -27,12 +32,28 @@ export default function UserManagementPanel({ onBack }) {
   const [message, setMessage] = useState(null);
   const [error, setError] = useState(null);
   const [isLoading, setIsLoading] = useState(false);
-  const [authToken, setAuthToken] = useState(null);
-  const [currentUser, setCurrentUser] = useState(null);
+  const [authToken, setAuthToken] = useState(initialAuthToken);
+  const [currentUser, setCurrentUser] = useState(initialUser);
   const [statusHistory, setStatusHistory] = useState([]);
   const [statusInput, setStatusInput] = useState('');
 
   const isAuthenticated = useMemo(() => Boolean(authToken && currentUser), [authToken, currentUser]);
+
+  useEffect(() => {
+    setAuthToken(initialAuthToken);
+  }, [initialAuthToken]);
+
+  useEffect(() => {
+    setCurrentUser(initialUser);
+  }, [initialUser]);
+
+  useEffect(() => {
+    if (!authToken) {
+      setStatusHistory([]);
+      return;
+    }
+    loadStatuses(authToken);
+  }, [authToken]);
 
   const resetMessages = () => {
     setMessage(null);
@@ -108,8 +129,14 @@ export default function UserManagementPanel({ onBack }) {
       });
       setAuthToken(payload.token);
       setCurrentUser(payload.user);
+      setStatusHistory([]);
       setMessage('Login erfolgreich.');
       setLoginForm(defaultLoginState);
+      onAuthChange?.({
+        token: payload.token,
+        user: payload.user,
+        progress: payload.progress
+      });
       await loadStatuses(payload.token);
     } catch (loginError) {
       setError(loginError.message);
@@ -141,9 +168,13 @@ export default function UserManagementPanel({ onBack }) {
       ]);
       setStatusInput('');
       setMessage('Status aktualisiert.');
-      setCurrentUser((prev) =>
-        prev ? { ...prev, status: payload.status.status, statusUpdatedAt: payload.status.createdAt } : prev
-      );
+      const updatedUser = currentUser
+        ? { ...currentUser, status: payload.status.status, statusUpdatedAt: payload.status.createdAt }
+        : currentUser;
+      setCurrentUser(updatedUser);
+      if (updatedUser) {
+        onAuthChange?.({ token: authToken, user: updatedUser });
+      }
     } catch (statusError) {
       setError(statusError.message);
     } finally {
@@ -156,6 +187,7 @@ export default function UserManagementPanel({ onBack }) {
     setCurrentUser(null);
     setStatusHistory([]);
     setMessage('Abgemeldet.');
+    onAuthChange?.({ token: null, user: null });
   };
 
   return (

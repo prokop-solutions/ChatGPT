@@ -11,8 +11,10 @@ import {
   findUserByEmail,
   findUserById,
   getLatestStatusForUser,
+  getLearningStateForUser,
   getStatusesForUser,
-  listUsersWithLatestStatus
+  listUsersWithLatestStatus,
+  upsertLearningState
 } from './repositories/userRepository.js';
 import { requireAuth } from './middleware/authMiddleware.js';
 
@@ -24,6 +26,24 @@ const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-me';
 const ALLOWED_ORIGINS = process.env.CLIENT_ORIGIN
   ? process.env.CLIENT_ORIGIN.split(',').map((origin) => origin.trim())
   : ['http://localhost:5173'];
+
+const formatProgressResponse = (state) => ({
+  leitnerBoxes: state?.leitnerBoxes || {},
+  flashcardIndex: Number.isFinite(state?.flashcardIndex) ? state.flashcardIndex : 0,
+  quizScore: {
+    correct: Number.isFinite(state?.quizScore?.correct) ? state.quizScore.correct : 0,
+    total: Number.isFinite(state?.quizScore?.total) ? state.quizScore.total : 0
+  },
+  updatedAt: state?.updatedAt || null
+});
+
+const normaliseBoxValue = (value) => {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return 1;
+  }
+  return Math.min(5, Math.max(1, Math.round(numeric)));
+};
 
 app.use(
   cors({
@@ -59,13 +79,15 @@ app.post('/api/auth/register', async (req, res) => {
     const passwordHash = await bcrypt.hash(password, 12);
     const user = createUser(normalisedEmail, passwordHash, status || 'pending');
     const latestStatus = getLatestStatusForUser(user.id);
+    const progress = getLearningStateForUser(user.id);
     res.status(201).json({
       user: {
         id: user.id,
         email: user.email,
         status: latestStatus?.status || null,
         statusUpdatedAt: latestStatus?.created_at || null
-      }
+      },
+      progress: formatProgressResponse(progress)
     });
   } catch (error) {
     console.error('Error creating user', error);
@@ -94,6 +116,7 @@ app.post('/api/auth/login', async (req, res) => {
     expiresIn: '2h'
   });
   const latestStatus = getLatestStatusForUser(user.id);
+  const progress = getLearningStateForUser(user.id);
 
   res.json({
     token,
@@ -102,7 +125,8 @@ app.post('/api/auth/login', async (req, res) => {
       email: user.email,
       status: latestStatus?.status || null,
       statusUpdatedAt: latestStatus?.created_at || null
-    }
+    },
+    progress: formatProgressResponse(progress)
   });
 });
 
@@ -121,13 +145,15 @@ app.get('/api/users', requireAuth, (req, res) => {
 app.get('/api/users/me', requireAuth, (req, res) => {
   const user = findUserById(req.user.id);
   const latestStatus = getLatestStatusForUser(req.user.id);
+  const progress = getLearningStateForUser(req.user.id);
   res.json({
     user: {
       id: user.id,
       email: user.email,
       status: latestStatus?.status || null,
       statusUpdatedAt: latestStatus?.created_at || null
-    }
+    },
+    progress: formatProgressResponse(progress)
   });
 });
 
@@ -152,6 +178,75 @@ app.post('/api/users/me/statuses', requireAuth, (req, res) => {
       createdAt: latest.created_at
     }
   });
+});
+
+app.get('/api/users/me/progress', requireAuth, (req, res) => {
+  const state = getLearningStateForUser(req.user.id) ||
+    upsertLearningState(req.user.id, {
+      leitnerBoxes: {},
+      flashcardIndex: 0,
+      quizScore: { correct: 0, total: 0 }
+    });
+  res.json({ progress: formatProgressResponse(state) });
+});
+
+app.put('/api/users/me/progress', requireAuth, (req, res) => {
+  const { leitnerBoxes, flashcardIndex, quizScore } = req.body || {};
+
+  const existingState = getLearningStateForUser(req.user.id) || {
+    leitnerBoxes: {},
+    flashcardIndex: 0,
+    quizScore: { correct: 0, total: 0 }
+  };
+
+  let boxesToPersist = { ...existingState.leitnerBoxes };
+  if (leitnerBoxes !== undefined) {
+    if (leitnerBoxes === null) {
+      boxesToPersist = {};
+    } else if (typeof leitnerBoxes === 'object' && !Array.isArray(leitnerBoxes)) {
+      const sanitised = {};
+      for (const [diagnosis, value] of Object.entries(leitnerBoxes)) {
+        sanitised[diagnosis] = normaliseBoxValue(value);
+      }
+      boxesToPersist = sanitised;
+    } else {
+      return res.status(400).json({ message: 'leitnerBoxes must be an object.' });
+    }
+  }
+
+  let flashcardIndexToPersist = existingState.flashcardIndex;
+  if (flashcardIndex !== undefined) {
+    if (Number.isFinite(flashcardIndex) && flashcardIndex >= 0) {
+      flashcardIndexToPersist = Math.floor(flashcardIndex);
+    } else {
+      return res.status(400).json({ message: 'flashcardIndex must be a positive number.' });
+    }
+  }
+
+  const existingQuiz = existingState.quizScore || { correct: 0, total: 0 };
+  let quizScoreToPersist = { ...existingQuiz };
+  if (quizScore !== undefined) {
+    if (quizScore && typeof quizScore === 'object' && !Array.isArray(quizScore)) {
+      const correct = Number.isFinite(quizScore.correct) && quizScore.correct >= 0
+        ? Math.floor(quizScore.correct)
+        : 0;
+      const total = Number.isFinite(quizScore.total) && quizScore.total >= 0
+        ? Math.max(Math.floor(quizScore.total), correct)
+        : correct;
+      quizScoreToPersist = { correct, total };
+    } else {
+      return res.status(400).json({ message: 'quizScore must be an object.' });
+    }
+  }
+
+  const nextState = {
+    leitnerBoxes: boxesToPersist,
+    flashcardIndex: flashcardIndexToPersist,
+    quizScore: quizScoreToPersist
+  };
+
+  const saved = upsertLearningState(req.user.id, nextState);
+  res.json({ progress: formatProgressResponse(saved) });
 });
 
 app.use((err, req, res, next) => {

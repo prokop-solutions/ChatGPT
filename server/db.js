@@ -38,6 +38,17 @@ db.exec(`
 
   CREATE INDEX IF NOT EXISTS idx_user_statuses_user_id_created_at
     ON user_statuses (user_id, created_at DESC);
+
+  CREATE TABLE IF NOT EXISTS user_learning_states (
+    user_id INTEGER PRIMARY KEY,
+    leitner_boxes TEXT NOT NULL DEFAULT '{}',
+    flashcard_index INTEGER NOT NULL DEFAULT 0,
+    quiz_correct INTEGER NOT NULL DEFAULT 0,
+    quiz_total INTEGER NOT NULL DEFAULT 0,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+  );
+
 `);
 
 export default db;

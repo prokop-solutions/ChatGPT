@@ -22,12 +22,62 @@ const getAllUsersStmt = db.prepare(`
   ORDER BY u.created_at DESC
 `);
 
+const getLearningStateStmt = db.prepare(
+  `SELECT user_id, leitner_boxes, flashcard_index, quiz_correct, quiz_total, updated_at
+     FROM user_learning_states
+    WHERE user_id = ?`
+);
+const insertLearningStateStmt = db.prepare(
+  `INSERT INTO user_learning_states (user_id, leitner_boxes, flashcard_index, quiz_correct, quiz_total)
+   VALUES (@user_id, @leitner_boxes, @flashcard_index, @quiz_correct, @quiz_total)`
+);
+const updateLearningStateStmt = db.prepare(
+  `UPDATE user_learning_states
+      SET leitner_boxes = @leitner_boxes,
+          flashcard_index = @flashcard_index,
+          quiz_correct = @quiz_correct,
+          quiz_total = @quiz_total,
+          updated_at = CURRENT_TIMESTAMP
+    WHERE user_id = @user_id`
+);
+
 const createUserWithStatus = db.transaction((email, passwordHash, initialStatus) => {
   const result = insertUserStmt.run({ email, password_hash: passwordHash });
   const userId = Number(result.lastInsertRowid);
   insertStatusStmt.run(userId, initialStatus);
+  insertLearningStateStmt.run({
+    user_id: userId,
+    leitner_boxes: '{}',
+    flashcard_index: 0,
+    quiz_correct: 0,
+    quiz_total: 0
+  });
   return getUserByIdStmt.get(userId);
 });
+
+const mapLearningState = (row) => {
+  if (!row) {
+    return null;
+  }
+
+  let boxes;
+  try {
+    boxes = row.leitner_boxes ? JSON.parse(row.leitner_boxes) : {};
+  } catch (error) {
+    boxes = {};
+  }
+
+  return {
+    userId: row.user_id,
+    leitnerBoxes: boxes,
+    flashcardIndex: Number.isFinite(row.flashcard_index) ? row.flashcard_index : 0,
+    quizScore: {
+      correct: Number.isFinite(row.quiz_correct) ? row.quiz_correct : 0,
+      total: Number.isFinite(row.quiz_total) ? row.quiz_total : 0
+    },
+    updatedAt: row.updated_at
+  };
+};
 
 export function createUser(email, passwordHash, initialStatus = 'pending') {
   return createUserWithStatus(email, passwordHash, initialStatus);
@@ -56,4 +106,27 @@ export function getLatestStatusForUser(userId) {
 
 export function listUsersWithLatestStatus() {
   return getAllUsersStmt.all();
+}
+
+export function getLearningStateForUser(userId) {
+  return mapLearningState(getLearningStateStmt.get(userId));
+}
+
+export function upsertLearningState(userId, state) {
+  const payload = {
+    user_id: userId,
+    leitner_boxes: JSON.stringify(state?.leitnerBoxes || {}),
+    flashcard_index: Number.isFinite(state?.flashcardIndex) ? state.flashcardIndex : 0,
+    quiz_correct: Number.isFinite(state?.quizScore?.correct) ? state.quizScore.correct : 0,
+    quiz_total: Number.isFinite(state?.quizScore?.total) ? state.quizScore.total : 0
+  };
+
+  const existing = getLearningStateStmt.get(userId);
+  if (existing) {
+    updateLearningStateStmt.run(payload);
+  } else {
+    insertLearningStateStmt.run(payload);
+  }
+
+  return getLearningStateForUser(userId);
 }
