@@ -4,7 +4,6 @@ import dotenv from 'dotenv';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 
-import './db.js';
 import {
   addStatus,
   createUser,
@@ -14,6 +13,7 @@ import {
   getLearningStateForUser,
   getStatusesForUser,
   listUsersWithLatestStatus,
+  repositoryMode,
   upsertLearningState
 } from './repositories/userRepository.js';
 import { requireAuth } from './middleware/authMiddleware.js';
@@ -58,7 +58,7 @@ app.use(
 app.use(express.json());
 
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok' });
+  res.json({ status: 'ok', storage: repositoryMode });
 });
 
 app.post('/api/auth/register', async (req, res) => {
@@ -70,22 +70,27 @@ app.post('/api/auth/register', async (req, res) => {
 
   const normalisedEmail = String(email).toLowerCase().trim();
 
-  const existing = findUserByEmail(normalisedEmail);
-  if (existing) {
-    return res.status(409).json({ message: 'A user with this email already exists.' });
+  try {
+    const existing = await findUserByEmail(normalisedEmail);
+    if (existing) {
+      return res.status(409).json({ message: 'A user with this email already exists.' });
+    }
+  } catch (error) {
+    console.error('Error checking for existing user', error);
+    return res.status(500).json({ message: 'Unable to create user.' });
   }
 
   try {
     const passwordHash = await bcrypt.hash(password, 12);
-    const user = createUser(normalisedEmail, passwordHash, status || 'pending');
-    const latestStatus = getLatestStatusForUser(user.id);
-    const progress = getLearningStateForUser(user.id);
+    const user = await createUser(normalisedEmail, passwordHash, status || 'pending');
+    const latestStatus = await getLatestStatusForUser(user.id);
+    const progress = await getLearningStateForUser(user.id);
     res.status(201).json({
       user: {
         id: user.id,
         email: user.email,
         status: latestStatus?.status || null,
-        statusUpdatedAt: latestStatus?.created_at || null
+        statusUpdatedAt: latestStatus?.created_at || latestStatus?.createdAt || null
       },
       progress: formatProgressResponse(progress)
     });
@@ -102,7 +107,14 @@ app.post('/api/auth/login', async (req, res) => {
     return res.status(400).json({ message: 'Email and password are required.' });
   }
 
-  const user = findUserByEmail(String(email).toLowerCase().trim());
+  let user;
+  try {
+    user = await findUserByEmail(String(email).toLowerCase().trim());
+  } catch (error) {
+    console.error('Error retrieving user during login', error);
+    return res.status(500).json({ message: 'Unable to login.' });
+  }
+
   if (!user) {
     return res.status(401).json({ message: 'Invalid credentials.' });
   }
@@ -115,8 +127,8 @@ app.post('/api/auth/login', async (req, res) => {
   const token = jwt.sign({ sub: user.id, email: user.email }, JWT_SECRET, {
     expiresIn: '2h'
   });
-  const latestStatus = getLatestStatusForUser(user.id);
-  const progress = getLearningStateForUser(user.id);
+  const latestStatus = await getLatestStatusForUser(user.id);
+  const progress = await getLearningStateForUser(user.id);
 
   res.json({
     token,
@@ -124,80 +136,104 @@ app.post('/api/auth/login', async (req, res) => {
       id: user.id,
       email: user.email,
       status: latestStatus?.status || null,
-      statusUpdatedAt: latestStatus?.created_at || null
+      statusUpdatedAt: latestStatus?.created_at || latestStatus?.createdAt || null
     },
     progress: formatProgressResponse(progress)
   });
 });
 
-app.get('/api/users', requireAuth, (req, res) => {
-  const users = listUsersWithLatestStatus().map((user) => ({
-    id: user.id,
-    email: user.email,
-    createdAt: user.created_at,
-    updatedAt: user.updated_at,
-    status: user.latest_status,
-    statusUpdatedAt: user.latest_status_at
-  }));
-  res.json({ users });
-});
-
-app.get('/api/users/me', requireAuth, (req, res) => {
-  const user = findUserById(req.user.id);
-  const latestStatus = getLatestStatusForUser(req.user.id);
-  const progress = getLearningStateForUser(req.user.id);
-  res.json({
-    user: {
+app.get('/api/users', requireAuth, async (req, res, next) => {
+  try {
+    const users = (await listUsersWithLatestStatus()).map((user) => ({
       id: user.id,
       email: user.email,
-      status: latestStatus?.status || null,
-      statusUpdatedAt: latestStatus?.created_at || null
-    },
-    progress: formatProgressResponse(progress)
-  });
+      createdAt: user.created_at,
+      updatedAt: user.updated_at,
+      status: user.latest_status,
+      statusUpdatedAt: user.latest_status_at
+    }));
+    res.json({ users });
+  } catch (error) {
+    next(error);
+  }
 });
 
-app.get('/api/users/me/statuses', requireAuth, (req, res) => {
-  const statuses = getStatusesForUser(req.user.id).map((row) => ({
-    id: row.id,
-    status: row.status,
-    createdAt: row.created_at
-  }));
-  res.json({ statuses });
+app.get('/api/users/me', requireAuth, async (req, res, next) => {
+  try {
+    const user = await findUserById(req.user.id);
+    const latestStatus = await getLatestStatusForUser(req.user.id);
+    const progress = await getLearningStateForUser(req.user.id);
+    res.json({
+      user: {
+        id: user.id,
+        email: user.email,
+        status: latestStatus?.status || null,
+        statusUpdatedAt: latestStatus?.created_at || latestStatus?.createdAt || null
+      },
+      progress: formatProgressResponse(progress)
+    });
+  } catch (error) {
+    next(error);
+  }
 });
 
-app.post('/api/users/me/statuses', requireAuth, (req, res) => {
+app.get('/api/users/me/statuses', requireAuth, async (req, res, next) => {
+  try {
+    const statuses = (await getStatusesForUser(req.user.id)).map((row) => ({
+      id: row.id,
+      status: row.status,
+      createdAt: row.created_at || row.createdAt
+    }));
+    res.json({ statuses });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post('/api/users/me/statuses', requireAuth, async (req, res, next) => {
   const { status } = req.body || {};
   if (!status) {
     return res.status(400).json({ message: 'Status is required.' });
   }
-  const latest = addStatus(req.user.id, status);
-  res.status(201).json({
-    status: {
-      status: latest.status,
-      createdAt: latest.created_at
-    }
-  });
+
+  try {
+    const latest = await addStatus(req.user.id, status);
+    res.status(201).json({
+      status: {
+        status: latest.status,
+        createdAt: latest.created_at || latest.createdAt
+      }
+    });
+  } catch (error) {
+    next(error);
+  }
 });
 
-app.get('/api/users/me/progress', requireAuth, (req, res) => {
-  const state = getLearningStateForUser(req.user.id) ||
-    upsertLearningState(req.user.id, {
+app.get('/api/users/me/progress', requireAuth, async (req, res, next) => {
+  try {
+    const state = (await getLearningStateForUser(req.user.id)) ||
+      (await upsertLearningState(req.user.id, {
+        leitnerBoxes: {},
+        flashcardIndex: 0,
+        quizScore: { correct: 0, total: 0 }
+      }));
+    res.json({ progress: formatProgressResponse(state) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.put('/api/users/me/progress', requireAuth, async (req, res, next) => {
+  const { leitnerBoxes, flashcardIndex, quizScore } = req.body || {};
+
+  let existingState = await getLearningStateForUser(req.user.id);
+  if (!existingState) {
+    existingState = {
       leitnerBoxes: {},
       flashcardIndex: 0,
       quizScore: { correct: 0, total: 0 }
-    });
-  res.json({ progress: formatProgressResponse(state) });
-});
-
-app.put('/api/users/me/progress', requireAuth, (req, res) => {
-  const { leitnerBoxes, flashcardIndex, quizScore } = req.body || {};
-
-  const existingState = getLearningStateForUser(req.user.id) || {
-    leitnerBoxes: {},
-    flashcardIndex: 0,
-    quizScore: { correct: 0, total: 0 }
-  };
+    };
+  }
 
   let boxesToPersist = { ...existingState.leitnerBoxes };
   if (leitnerBoxes !== undefined) {
@@ -245,8 +281,12 @@ app.put('/api/users/me/progress', requireAuth, (req, res) => {
     quizScore: quizScoreToPersist
   };
 
-  const saved = upsertLearningState(req.user.id, nextState);
-  res.json({ progress: formatProgressResponse(saved) });
+  try {
+    const saved = await upsertLearningState(req.user.id, nextState);
+    res.json({ progress: formatProgressResponse(saved) });
+  } catch (error) {
+    next(error);
+  }
 });
 
 app.use((err, req, res, next) => {
@@ -255,5 +295,5 @@ app.use((err, req, res, next) => {
 });
 
 app.listen(port, () => {
-  console.log(`User service listening on port ${port}`);
+  console.log(`User service listening on port ${port} using ${repositoryMode} storage`);
 });

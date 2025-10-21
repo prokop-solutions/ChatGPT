@@ -46,12 +46,14 @@ Der Preview-Server dient zum Testen des optimierten Builds.
 ├── package.json
 ├── postcss.config.js
 ├── server
-│   ├── db.js                   # Initialisiert DB und Tabellen (users, user_statuses, user_learning_states)
-│   ├── index.js                # Express-Server mit Auth-/Status-/Progress-Endpunkten
+│   ├── db.js                               # Initialisiert die lokale SQLite-DB
+│   ├── index.js                            # Express-Server mit Auth-/Status-/Progress-Endpunkten
 │   ├── middleware
-│   │   └── authMiddleware.js   # JWT-Validierung für geschützte Routen
+│   │   └── authMiddleware.js               # JWT-Validierung für geschützte Routen
 │   └── repositories
-│       └── userRepository.js   # CRUD-Operationen für Benutzer & Stati
+│       ├── sqliteUserRepository.js         # Implementierung für lokale SQLite-Speicherung
+│       ├── supabaseUserRepository.js       # Implementierung für Supabase/Postgres
+│       └── userRepository.js               # Wählt automatisch das passende Repository
 ├── tailwind.config.js
 ├── vite.config.js
 └── src
@@ -65,20 +67,29 @@ Der Preview-Server dient zum Testen des optimierten Builds.
 
 Die ICD-10-Lernmodi leben in `ICD10LearningSystem.jsx`. Das neue `UserManagementPanel.jsx` bindet die Express-API ein und bietet Registrierung, Login, Statusverwaltung und synchronisierten Lernfortschritt.
 
-## Benutzer-Service (Express + SQLite)
+## Benutzer-Service (Express + SQLite oder Supabase)
 
 - Passwörter werden mit [bcryptjs](https://www.npmjs.com/package/bcryptjs) gehasht und niemals im Klartext gespeichert.
-- Stati werden getrennt von Stammdaten in der Tabelle `user_statuses` versioniert und sind damit nachvollziehbar.
+- Stati werden getrennt von Stammdaten versioniert (`user_statuses`).
 - Lernstände (Leitner-Boxen, Flashcard-Index, kumulative Quizwerte) landen in `user_learning_states` und werden automatisch bei jeder Änderung gespeichert.
 - Authentifizierung erfolgt via JWT (Gültigkeit standardmäßig 2 Stunden).
-- Standard-Ports und Pfade lassen sich per Environment-Variablen überschreiben:
+- Der Server entscheidet beim Start automatisch, ob er die lokale SQLite-DB oder Supabase/Postgres nutzt:
+  - **Ohne Supabase-Umgebungsvariablen** wird `better-sqlite3` verwendet und die Datei `data/users.db` automatisch angelegt.
+  - **Mit Supabase** (`SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY`) wird die dortige Datenbank genutzt. Optional lassen sich die Tabellennamen anpassen.
+- Das Health-Endpoint `GET /api/health` zeigt unter `storage`, welche Variante aktiv ist (`sqlite` oder `supabase`).
+- Wichtige Environment-Variablen:
 
 | Variable | Zweck | Standard |
 | --- | --- | --- |
 | `PORT` | Port des Express-Servers | `4000` |
 | `CLIENT_ORIGIN` | Erlaubte Origins, kommasepariert | `http://localhost:5173` |
 | `JWT_SECRET` | Secret für Token-Signierung | `dev-secret-change-me` |
-| `USER_DB_PATH` | Pfad zur SQLite-Datei | `data/users.db` |
+| `USER_DB_PATH` | Pfad zur SQLite-Datei (nur SQLite) | `data/users.db` |
+| `SUPABASE_URL` | URL deines Supabase-Projekts (aktiviert Supabase-Modus) | – |
+| `SUPABASE_SERVICE_ROLE_KEY` | Service-Role-Key mit Schreibrechten | – |
+| `SUPABASE_USERS_TABLE` | (Optional) Name der Benutzer-Tabelle | `app_users` |
+| `SUPABASE_USER_STATUSES_TABLE` | (Optional) Name der Status-Tabelle | `user_statuses` |
+| `SUPABASE_USER_PROGRESS_TABLE` | (Optional) Name der Fortschritts-Tabelle | `user_learning_states` |
 
 ### Wichtige API-Endpunkte
 
@@ -91,3 +102,52 @@ Die ICD-10-Lernmodi leben in `ICD10LearningSystem.jsx`. Das neue `UserManagement
 - `PUT /api/users/me/progress` – Lernfortschritt aktualisieren (wird vom Frontend automatisch angestoßen).
 
 Für produktive Deployments sollte der Server hinter HTTPS laufen und `JWT_SECRET` unbedingt ersetzt werden.
+
+### Supabase-Setup
+
+1. Lege in deinem Supabase-Projekt folgende Tabellen an (SQL-Beispiel):
+
+   ```sql
+   create table public.app_users (
+     id uuid primary key default gen_random_uuid(),
+     email text not null unique,
+     password_hash text not null,
+     created_at timestamptz default now(),
+     updated_at timestamptz default now()
+   );
+
+   create or replace function public.set_updated_at()
+   returns trigger as $$
+   begin
+     new.updated_at = now();
+     return new;
+   end;
+   $$ language plpgsql;
+
+   create trigger trg_app_users_updated
+   before update on public.app_users
+   for each row execute function public.set_updated_at();
+
+   create table public.user_statuses (
+     id uuid primary key default gen_random_uuid(),
+     user_id uuid references public.app_users(id) on delete cascade,
+     status text not null,
+     created_at timestamptz default now()
+   );
+
+   create table public.user_learning_states (
+     user_id uuid primary key references public.app_users(id) on delete cascade,
+     leitner_boxes jsonb not null default '{}'::jsonb,
+     flashcard_index integer not null default 0,
+     quiz_correct integer not null default 0,
+     quiz_total integer not null default 0,
+     updated_at timestamptz default now()
+   );
+
+   create trigger trg_user_learning_states_updated
+   before update on public.user_learning_states
+   for each row execute function public.set_updated_at();
+   ```
+
+2. Hinterlege `SUPABASE_URL` und `SUPABASE_SERVICE_ROLE_KEY` (z. B. via `.env`).
+3. Starte den Server wie gewohnt mit `npm run server`. Das Health-Endpoint bestätigt, dass `storage: "supabase"` aktiv ist.

@@ -11,15 +11,22 @@ export function requireAuth(req, res, next) {
     return res.status(401).json({ message: 'Authentication token is missing.' });
   }
 
+  let payload;
   try {
-    const payload = jwt.verify(token, JWT_SECRET);
-    const user = findUserById(payload.sub);
-    if (!user) {
-      return res.status(401).json({ message: 'User not found.' });
-    }
-    req.user = { id: user.id, email: user.email };
-    next();
+    payload = jwt.verify(token, JWT_SECRET);
   } catch (error) {
     return res.status(401).json({ message: 'Invalid or expired token.' });
   }
+
+  findUserById(payload.sub)
+    .then((user) => {
+      if (!user) {
+        return res.status(401).json({ message: 'User not found.' });
+      }
+      req.user = { id: user.id, email: user.email };
+      return next();
+    })
+    .catch((error) => {
+      next(error);
+    });
 }
